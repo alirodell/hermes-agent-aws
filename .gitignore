@@ -1,0 +1,20 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+terraform.tfvars
+backend.hcl
+*.auto.tfvars
+override.tf
+override.tf.json
+
+# Secrets — never commit
+.env
+*.env
+secrets*.json
+*credentials*.csv
+*accessKeys*.csv
+
+.DS_Store

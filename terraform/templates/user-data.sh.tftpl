@@ -1,0 +1,472 @@
+#!/bin/bash
+# Bootstrap for the Hermes agent host (Amazon Linux 2023, x86_64).
+# Rendered by Terraform templatefile(): a doubled dollar before a brace is a literal bash expansion;
+# a single dollar-brace is a Terraform template variable.
+# Runs once, on first boot. Log: /var/log/agent-bootstrap.log
+set -euxo pipefail
+exec > >(tee -a /var/log/agent-bootstrap.log) 2>&1
+
+REGION="${region}"
+BUCKET="${bucket}"
+SECRET_ID="${secret_id}"
+GOOGLE_SECRET_ID="${google_secret_id}"
+MODEL="${openrouter_model}"
+INSTALL_BROWSER="${install_browser}"
+INSTALL_REF="${install_ref}"
+SIGNAL_VERSION="${signal_version}"
+SIGNAL_SHA256="${signal_sha256}"
+GH_VERSION="${gh_version}"
+GH_SHA256="${gh_sha256}"
+AGENT_MEMORY_MAX="${agent_memory_max_mb}M"
+SESSION_MEMORY_MAX="${session_memory_max_mb}M"
+
+HUSER=hermes
+HHOME=/home/$HUSER
+HERMES_HOME=$HHOME/.hermes
+WORK_DIR=$HHOME/work
+SIGNAL_DIR=$HHOME/.local/share/signal-cli
+
+# ---------- OS ----------
+dnf -y upgrade
+dnf -y install git jq tar gzip libatomic dnf-automatic
+
+# Java 25 for signal-cli. qrencode renders the device-link QR code in the terminal (optional).
+dnf -y install java-25-amazon-corretto-headless
+dnf -y install qrencode || echo "qrencode unavailable; signal-link will print the link URI instead"
+
+# Automatic security updates (no auto-reboot).
+sed -i 's/^upgrade_type.*/upgrade_type = security/; s/^apply_updates.*/apply_updates = yes/' /etc/dnf/automatic.conf
+systemctl enable --now dnf-automatic.timer
+
+# SSM agent ships with AL2023; make sure it's running.
+systemctl enable --now amazon-ssm-agent
+
+# 2 GiB swap — headroom for Hermes + the signal-cli JVM.
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=2048
+  chmod 600 /swapfile
+  mkswap /swapfile
+  echo '/swapfile none swap defaults 0 0' >> /etc/fstab
+fi
+swapon -a
+
+# ---------- Agent user + shared settings ----------
+id $HUSER >/dev/null 2>&1 || useradd --create-home --shell /bin/bash $HUSER
+install -d -o $HUSER -g $HUSER -m 700 $HERMES_HOME
+install -d -o $HUSER -g $HUSER -m 750 $WORK_DIR
+install -d -o $HUSER -g $HUSER -m 700 $HHOME/.local $HHOME/.local/share $SIGNAL_DIR
+
+install -d -m 755 /etc/hermes-agent
+cat > /etc/hermes-agent/env <<EOF
+REGION=$REGION
+BUCKET=$BUCKET
+SECRET_ID=$SECRET_ID
+GOOGLE_SECRET_ID=$GOOGLE_SECRET_ID
+HERMES_HOME=$HERMES_HOME
+WORK_DIR=$WORK_DIR
+SIGNAL_DIR=$SIGNAL_DIR
+EOF
+chmod 644 /etc/hermes-agent/env
+
+# ---------- Helper: pull secrets into ~/.hermes/.env (and gh's credential store) ----------
+# Writes every key in the Secrets Manager JSON into a marked block in .env, leaving any
+# lines Hermes itself wrote outside the block untouched. GH_TOKEN is the exception: Hermes
+# treats GH_TOKEN/GITHUB_TOKEN as Copilot provider credentials and scrubs them from every
+# command it runs (no env_passthrough override), so instead gh is logged in with the token
+# and stores it in ~/.config/gh/hosts.yml, which gh and the git credential helper read directly.
+cat > /usr/local/sbin/hermes-fetch-secrets <<'EOF'
+#!/bin/bash
+set -euo pipefail
+. /etc/hermes-agent/env
+ENV_FILE="$HERMES_HOME/.env"
+BEGIN='# >>> managed by hermes-fetch-secrets (from AWS Secrets Manager) >>>'
+END='# <<< managed by hermes-fetch-secrets <<<'
+
+if ! json=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ID" \
+      --query SecretString --output text 2>/tmp/hermes-fetch-secrets.err); then
+  echo "Could not read $SECRET_ID — has scripts/set-secrets.sh been run?" >&2
+  cat /tmp/hermes-fetch-secrets.err >&2
+  exit 1
+fi
+
+umask 077
+touch "$ENV_FILE"
+tmp=$(mktemp "$HERMES_HOME/.env.XXXXXX")
+sed "/^$BEGIN\$/,/^$END\$/d" "$ENV_FILE" > "$tmp"
+{
+  echo "$BEGIN"
+  echo "$json" | jq -r 'del(.GH_TOKEN) | to_entries[] | select(.value != null and .value != "") | "\(.key)=\(.value | tostring)"'
+  echo "$END"
+} >> "$tmp"
+chown hermes:hermes "$tmp"
+chmod 600 "$tmp"
+mv "$tmp" "$ENV_FILE"
+
+# GitHub: log gh in (or out) from GH_TOKEN. Non-fatal so a GitHub outage can't block the agent.
+GH_BIN=$(command -v gh || echo /home/hermes/.local/bin/gh)
+gh_token=$(echo "$json" | jq -r '.GH_TOKEN // empty')
+if [ ! -x "$GH_BIN" ]; then
+  [ -z "$gh_token" ] || echo "WARNING: GH_TOKEN is set but gh is not installed" >&2
+elif [ -n "$gh_token" ]; then
+  printf '%s\n' "$gh_token" | sudo -u hermes -H env -u GH_TOKEN -u GITHUB_TOKEN "$GH_BIN" auth login \
+      --hostname github.com --git-protocol https --insecure-storage --with-token \
+    || echo "WARNING: gh auth login failed; GitHub access unavailable until the next start" >&2
+else
+  sudo -u hermes -H "$GH_BIN" auth logout --hostname github.com >/dev/null 2>&1 || true
+fi
+
+# Google Workspace OAuth files: restore from their own secret if missing (e.g. after a rebuild).
+/usr/local/sbin/hermes-google-oauth restore \
+  || echo "WARNING: Google OAuth restore failed; google-workspace skill may need re-authorizing" >&2
+EOF
+chmod 700 /usr/local/sbin/hermes-fetch-secrets
+
+# ---------- Helper: Google Workspace OAuth files <-> Secrets Manager ----------
+cat > /usr/local/sbin/hermes-google-oauth <<'EOF'
+#!/bin/bash
+# Usage: hermes-google-oauth save | restore | status | clear
+#   save     ~/.hermes/google_client_secret.json + google_token.json -> Secrets Manager, only when the
+#            client or refresh token changed (hourly access-token refreshes don't count). Runs as part
+#            of every backup (hermes-sync push); run it by hand right after authorizing to save at once.
+#   restore  Secrets Manager -> those files, only for files that are missing locally (e.g. after a
+#            rebuild). The local copy always wins when present. Runs on every service start.
+#   status   Show whether local and stored copies exist and match (never prints secret values).
+#   clear    Empty the stored copy. Do this after revoking (setup.py --revoke deletes the local token;
+#            without clearing, the next restore would bring the revoked token back).
+set -euo pipefail
+. /etc/hermes-agent/env
+[ -n "$${GOOGLE_SECRET_ID:-}" ] || { echo "GOOGLE_SECRET_ID is not set in /etc/hermes-agent/env" >&2; exit 1; }
+CLIENT="$HERMES_HOME/google_client_secret.json"
+TOKEN="$HERMES_HOME/google_token.json"
+
+stored() {  # the stored JSON, or {} when the secret has no value yet
+  aws secretsmanager get-secret-value --region "$REGION" --secret-id "$GOOGLE_SECRET_ID" \
+    --query SecretString --output text 2>/dev/null || echo '{}'
+}
+# Identity of a credential set: client + refresh token. The access token changes hourly and is ignored.
+fp_local()  { jq -cS -n --slurpfile c "$CLIENT" --slurpfile t "$TOKEN" '{c: $c[0], r: $t[0].refresh_token}' | sha256sum | cut -c1-12; }
+fp_stored() { jq -cS '{c: .client_secret, r: .token.refresh_token}' | sha256sum | cut -c1-12; }
+have_local() { [ -s "$CLIENT" ] && [ -s "$TOKEN" ]; }
+write_file() {  # write stdin to $1 as hermes, mode 600, atomically
+  local tmp; tmp=$(mktemp "$HERMES_HOME/.google-oauth.XXXXXX")
+  cat > "$tmp"; chmod 600 "$tmp"; chown hermes:hermes "$tmp" 2>/dev/null || true; mv "$tmp" "$1"
+}
+
+case "$${1:-}" in
+  save)
+    have_local || { echo "No local Google OAuth files; nothing to save."; exit 0; }
+    jq -e '.refresh_token' "$TOKEN" >/dev/null || { echo "google_token.json has no refresh_token; not saving" >&2; exit 1; }
+    if [ "$(fp_local)" = "$(stored | fp_stored)" ]; then echo "Google OAuth: stored copy is current."; exit 0; fi
+    jq -c -n --slurpfile c "$CLIENT" --slurpfile t "$TOKEN" '{client_secret: $c[0], token: $t[0]}' \
+      | aws secretsmanager put-secret-value --region "$REGION" --secret-id "$GOOGLE_SECRET_ID" \
+          --secret-string file:///dev/stdin --query VersionId --output text >/dev/null
+    echo "Google OAuth: saved to Secrets Manager."
+    ;;
+  restore)
+    s=$(stored)
+    if [ -z "$(printf '%s' "$s" | jq -r '.token.refresh_token // empty')" ]; then
+      echo "Google OAuth: nothing stored."; exit 0
+    fi
+    [ -s "$CLIENT" ] || { printf '%s' "$s" | jq '.client_secret' | write_file "$CLIENT"; echo "Google OAuth: restored client."; }
+    [ -s "$TOKEN" ]  || { printf '%s' "$s" | jq '.token' | write_file "$TOKEN"; echo "Google OAuth: restored token."; }
+    ;;
+  status)
+    s=$(stored)
+    echo "local:  $(have_local && echo "present ($(fp_local))" || echo missing)"
+    echo "stored: $([ -n "$(printf '%s' "$s" | jq -r '.token.refresh_token // empty')" ] && echo "present ($(printf '%s' "$s" | fp_stored))" || echo empty)"
+    ;;
+  clear)
+    printf '{}' | aws secretsmanager put-secret-value --region "$REGION" --secret-id "$GOOGLE_SECRET_ID" \
+      --secret-string file:///dev/stdin --query VersionId --output text >/dev/null
+    echo "Google OAuth: stored copy cleared."
+    ;;
+  *) echo "usage: hermes-google-oauth save|restore|status|clear" >&2; exit 64 ;;
+esac
+EOF
+chmod 755 /usr/local/sbin/hermes-google-oauth
+
+# ---------- Helper: sync agent state <-> S3 ----------
+cat > /usr/local/sbin/hermes-sync <<'EOF'
+#!/bin/bash
+# Usage: hermes-sync push | pull | pull-imports
+#   push          ~/.hermes, ~/work and signal-cli state -> S3 (no --delete; bucket versioning keeps history)
+#   pull          S3 -> same (used on first boot of a rebuilt instance)
+#   pull-imports  s3://BUCKET/imports/skills/ -> ~/.hermes/skills/claude-code-imports/
+set -uo pipefail
+. /etc/hermes-agent/env
+# Applied to every tree.
+COMMON_EXCLUDES=(
+  --exclude ".env" --exclude ".env.*"
+  --exclude "*/node_modules/*" --exclude "*/__pycache__/*" --exclude "*/.venv/*"
+  --exclude "*.sock" --exclude "*.lock" --exclude "*.pid"
+)
+# ~/.hermes only: the code checkout, runtimes and caches are reinstalled/regenerated by the
+# bootstrap. Excluded in both directions so a stale runtime is never restored over a fresh install.
+HOME_EXCLUDES=(
+  --exclude "hermes-agent/*" --exclude "installs/*" --exclude "tools/*"
+  --exclude "cache/*" --exclude "logs/*"
+  # Google OAuth client + token live in Secrets Manager (hermes-google-oauth), never in S3.
+  --exclude "google_token.json" --exclude "google_client_secret.json" --exclude "google_oauth_*"
+)
+OPTS=(--region "$REGION" --only-show-errors)
+
+# aws s3 sync exits 2 when it skipped files it can't copy (e.g. Hermes' unix sockets) even
+# though everything else transferred, so treat 2 as success. Every tree is attempted; the
+# script fails at the end if any tree had a real error.
+rc=0
+s3sync() {
+  local r=0
+  aws s3 sync "$@" "$${OPTS[@]}" || r=$?
+  if [ "$r" -ne 0 ] && [ "$r" -ne 2 ]; then
+    echo "hermes-sync: aws s3 sync $1 -> $2 failed (exit $r)" >&2
+    rc=1
+  fi
+}
+
+case "$${1:-}" in
+  push)
+    s3sync "$HERMES_HOME" "s3://$BUCKET/hermes-home/" "$${COMMON_EXCLUDES[@]}" "$${HOME_EXCLUDES[@]}"
+    s3sync "$WORK_DIR" "s3://$BUCKET/work/" "$${COMMON_EXCLUDES[@]}"
+    s3sync "$SIGNAL_DIR" "s3://$BUCKET/signal-cli/"
+    /usr/local/sbin/hermes-google-oauth save >/dev/null || { echo "hermes-sync: Google OAuth save failed" >&2; rc=1; }
+    ;;
+  pull)
+    s3sync "s3://$BUCKET/hermes-home/" "$HERMES_HOME" "$${COMMON_EXCLUDES[@]}" "$${HOME_EXCLUDES[@]}"
+    s3sync "s3://$BUCKET/work/" "$WORK_DIR" "$${COMMON_EXCLUDES[@]}"
+    s3sync "s3://$BUCKET/signal-cli/" "$SIGNAL_DIR"
+    ;;
+  pull-imports)
+    mkdir -p "$HERMES_HOME/skills/claude-code-imports"
+    s3sync "s3://$BUCKET/imports/skills/" "$HERMES_HOME/skills/claude-code-imports/"
+    ;;
+  *)
+    echo "usage: hermes-sync push|pull|pull-imports" >&2
+    exit 64
+    ;;
+esac
+exit "$rc"
+EOF
+chmod 755 /usr/local/sbin/hermes-sync
+
+# ---------- Restore previous state (instance is disposable; S3 is the source of truth) ----------
+FIRST_EVER_BOOT=true
+if aws s3api list-objects-v2 --region "$REGION" --bucket "$BUCKET" --prefix hermes-home/ --max-items 1 \
+     --query 'Contents[0].Key' --output text | grep -q '^hermes-home/'; then
+  FIRST_EVER_BOOT=false
+  sudo -u $HUSER -H /usr/local/sbin/hermes-sync pull
+fi
+sudo -u $HUSER -H /usr/local/sbin/hermes-sync pull-imports
+
+# ---------- signal-cli (pinned release, checksum-verified) ----------
+SIGNAL_TGZ=/tmp/signal-cli-$SIGNAL_VERSION.tar.gz
+curl -fsSL -o "$SIGNAL_TGZ" \
+  "https://github.com/AsamK/signal-cli/releases/download/v$SIGNAL_VERSION/signal-cli-$SIGNAL_VERSION.tar.gz"
+echo "$SIGNAL_SHA256  $SIGNAL_TGZ" | sha256sum -c -
+tar -xzf "$SIGNAL_TGZ" -C /opt
+ln -sfn /opt/signal-cli-$SIGNAL_VERSION /opt/signal-cli
+ln -sf /opt/signal-cli/bin/signal-cli /usr/local/bin/signal-cli
+rm -f "$SIGNAL_TGZ"
+
+# Daemon wrapper: the account number comes from SIGNAL_ACCOUNT in ~/.hermes/.env.
+cat > /usr/local/sbin/signal-cli-daemon <<'EOF'
+#!/bin/bash
+set -euo pipefail
+. /etc/hermes-agent/env
+ACCOUNT=$(sed -n 's/^SIGNAL_ACCOUNT=//p' "$HERMES_HOME/.env" | tail -n 1)
+[ -n "$ACCOUNT" ] || { echo "SIGNAL_ACCOUNT is not set; run scripts/set-secrets.sh" >&2; exit 1; }
+exec /usr/local/bin/signal-cli --config "$SIGNAL_DIR" -a "$ACCOUNT" daemon --http 127.0.0.1:8080
+EOF
+chmod 755 /usr/local/sbin/signal-cli-daemon
+
+# One-time device linking: `sudo signal-link` (scripts/link-signal.sh runs it for you).
+cat > /usr/local/sbin/signal-link <<'EOF'
+#!/bin/bash
+set -euo pipefail
+. /etc/hermes-agent/env
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+NAME="$${1:-HermesAgent}"
+systemctl stop signal-cli.service || true
+echo "On your phone: Signal > Settings > Linked devices > Link new device, then scan the code below."
+echo "(No QR code? Copy the sgnl:// line and run on your laptop: qrencode -t ansiutf8 '<that line>')"
+echo
+if command -v qrencode >/dev/null; then
+  sudo -u hermes -H /usr/local/bin/signal-cli --config "$SIGNAL_DIR" link -n "$NAME" \
+    | tee >(grep --line-buffered '^sgnl://' | xargs -L 1 qrencode -t ansiutf8)
+else
+  sudo -u hermes -H /usr/local/bin/signal-cli --config "$SIGNAL_DIR" link -n "$NAME"
+fi
+echo "Linked. Starting signal-cli and restarting Hermes..."
+systemctl restart signal-cli.service hermes-agent.service
+systemctl --no-pager --lines=5 status signal-cli.service || true
+EOF
+chmod 755 /usr/local/sbin/signal-link
+
+# ---------- GitHub CLI (pinned release, checksum-verified) ----------
+# Auth is NOT baked in: set GH_TOKEN via scripts/set-secrets.sh (lands in ~/.hermes/.env), which gh
+# reads automatically. The git credential helper lets `git clone/push` over HTTPS use the same token.
+GH_TGZ=/tmp/gh-$GH_VERSION.tar.gz
+curl -fsSL -o "$GH_TGZ" \
+  "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_$${GH_VERSION}_linux_amd64.tar.gz"
+echo "$GH_SHA256  $GH_TGZ" | sha256sum -c -
+tar -xzf "$GH_TGZ" -C /tmp
+install -m 755 /tmp/gh_$${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh
+rm -rf "$GH_TGZ" /tmp/gh_$${GH_VERSION}_linux_amd64
+sudo -u $HUSER -H git config --global credential.https://github.com.helper ""
+sudo -u $HUSER -H git config --global --add credential.https://github.com.helper '!/usr/local/bin/gh auth git-credential'
+
+# ---------- Install Hermes ----------
+INSTALL_FLAGS="--non-interactive --branch $INSTALL_REF --skip-computer-use"
+if [ "$INSTALL_BROWSER" != "true" ]; then
+  INSTALL_FLAGS="$INSTALL_FLAGS --skip-browser"
+fi
+sudo -u $HUSER -H env HERMES_HOME=$HERMES_HOME bash -c \
+  "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/$INSTALL_REF/scripts/install.sh | bash -s -- $INSTALL_FLAGS"
+
+HERMES_BIN=$(sudo -u $HUSER -H bash -lc 'command -v hermes' || true)
+[ -n "$HERMES_BIN" ] || HERMES_BIN=$HHOME/.local/bin/hermes
+test -x "$HERMES_BIN"
+ln -sf "$HERMES_BIN" /usr/local/bin/hermes
+
+# ---------- First-ever boot: point Hermes at OpenRouter ----------
+if [ "$FIRST_EVER_BOOT" = "true" ]; then
+  if [ ! -f $HERMES_HOME/config.yaml ]; then
+    sudo -u $HUSER tee $HERMES_HOME/config.yaml >/dev/null <<EOF
+model:
+  provider: openrouter
+  default: "$MODEL"
+EOF
+  else
+    sudo -u $HUSER -H env HERMES_HOME=$HERMES_HOME "$HERMES_BIN" config set model.provider openrouter || true
+    sudo -u $HUSER -H env HERMES_HOME=$HERMES_HOME "$HERMES_BIN" config set model.default "$MODEL" || true
+  fi
+fi
+
+# ---------- systemd units ----------
+# Hermes' own `hermes gateway install` would also create a unit; we own the unit here instead so
+# secrets are refreshed from Secrets Manager on every start. Don't run `hermes gateway install`.
+cat > /etc/systemd/system/hermes-agent.service <<EOF
+[Unit]
+Description=Hermes Agent gateway (messaging + cron scheduler)
+After=network-online.target signal-cli.service
+Wants=network-online.target signal-cli.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$HUSER
+Group=$HUSER
+WorkingDirectory=$WORK_DIR
+Environment=HOME=$HHOME
+Environment=HERMES_HOME=$HERMES_HOME
+Environment=PATH=$HHOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=+/usr/local/sbin/hermes-fetch-secrets
+ExecStart=$HERMES_BIN gateway run
+Restart=always
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# Memory cap (normal use ~450 MiB). Over the cap the kernel OOM-kills the service and systemd
+# restarts it, instead of the whole box swapping to a standstill. Small swap allowance on purpose.
+MemoryMax=$AGENT_MEMORY_MAX
+MemorySwapMax=256M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Only starts once a device has been linked (signal-link creates accounts.json).
+# Listens on loopback only; Hermes connects via SIGNAL_HTTP_URL=http://127.0.0.1:8080.
+cat > /etc/systemd/system/signal-cli.service <<EOF
+[Unit]
+Description=signal-cli daemon (JSON-RPC over HTTP on 127.0.0.1:8080, used by Hermes)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$SIGNAL_DIR/data/accounts.json
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$HUSER
+Group=$HUSER
+Environment=HOME=$HHOME
+Environment=JAVA_OPTS=-Xmx512m
+ExecStartPre=+/usr/local/sbin/hermes-fetch-secrets
+ExecStart=/usr/local/sbin/signal-cli-daemon
+Restart=always
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+MemoryMax=768M
+MemorySwapMax=128M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/hermes-backup.service <<EOF
+[Unit]
+Description=Sync Hermes state, work dir and signal-cli state to S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$HUSER
+ExecStart=/usr/local/sbin/hermes-sync push
+EOF
+
+cat > /etc/systemd/system/hermes-backup.timer <<EOF
+[Unit]
+Description=Periodic Hermes -> S3 sync
+
+[Timer]
+OnCalendar=${backup_interval}
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Final sync on shutdown/terminate. Units stop in reverse start order, so Before= here means this
+# unit's ExecStop runs only after hermes-agent and signal-cli have exited (and while the network is up).
+cat > /etc/systemd/system/hermes-backup-on-shutdown.service <<EOF
+[Unit]
+Description=Sync Hermes state to S3 on shutdown
+After=network-online.target
+Wants=network-online.target
+Before=hermes-agent.service signal-cli.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=$HUSER
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/hermes-sync push
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Combined memory cap for everything the hermes user runs interactively (connect.sh -> `sudo -iu
+# hermes` lands in user-<uid>.slice via pam_systemd). A runaway session, e.g. a multi-MB paste into
+# the TUI, gets OOM-killed instead of freezing the box; SSM, the agent service and system stay up.
+HUID=$(id -u $HUSER)
+install -d /etc/systemd/system/user-$HUID.slice.d
+cat > /etc/systemd/system/user-$HUID.slice.d/50-memory.conf <<EOF
+[Slice]
+MemoryMax=$SESSION_MEMORY_MAX
+MemorySwapMax=256M
+EOF
+
+systemctl daemon-reload
+systemctl enable --now hermes-backup.timer hermes-backup-on-shutdown.service
+# Skipped (unmet condition) until a device is linked; after a rebuild that restored a linked account it starts normally.
+systemctl enable --now signal-cli.service || true
+# Fails (and retries every 30s) until the secret has a value — that's expected on a brand-new deploy.
+systemctl enable --now hermes-agent.service || true
+
+echo "Bootstrap complete."

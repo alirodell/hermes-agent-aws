@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars (gitignored) and edit.
+budget_alert_emails = ["you@example.com"]
+
+# name               = "hermes-agent"   # prefix for all resource names; match NAME used for the state bucket
+
+# aws_profile        = "personal"
+# instance_type      = "t3a.medium"     # x86_64 required for signal-cli
+# install_browser    = false            # true: consider t3a.large
+# openrouter_model   = "~anthropic/claude-sonnet-latest"
+# hermes_install_ref = "main"           # pin to a tag for reproducible rebuilds
+# signal_cli_version = "0.14.9"         # bump together with signal_cli_sha256
+# gh_cli_version     = "2.102.0"        # bump together with gh_cli_sha256
+# agent_memory_max_mb   = 1536       # memory cap for the background agent
+# session_memory_max_mb = 1536       # combined cap for interactive (connect.sh) sessions
+# monthly_budget_usd = 50
